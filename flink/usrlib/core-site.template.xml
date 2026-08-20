@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<!--
+  Hadoop core-site for the Delta Flink connector's Kernel engine (S3A).
+
+  Rendered by usrlib/init.sh: @S3_ENDPOINT_URL@ / @S3_ACCESS_KEY@ / @S3_SECRET_KEY@
+  are replaced from the environment so the same file works whether the RustFS
+  object store is reached via the host or a shared docker network.
+
+  These "ambient" credentials back the S3 path-based demos (sql/04, sql/05). This
+  build's Flink SQL `delta` factory only accepts a fixed option set (table_path,
+  partitions, uid, name, endpoint, token, write.mode, file_rolling.*, ...), so the
+  per-table `fs.s3a.*` / `credentials.source` options (PRs #7045/#7048) are not
+  settable in SQL - they are DataStream-API options. For path-based tables the
+  connector's Hadoop engine reads these S3A settings from here instead.
+
+  UC-managed tables (sql/03) ignore these and use UC-vended credentials.
+-->
+<configuration>
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>@S3_ENDPOINT_URL@</value>
+  </property>
+  <property>
+    <name>fs.s3a.access.key</name>
+    <value>@S3_ACCESS_KEY@</value>
+  </property>
+  <property>
+    <name>fs.s3a.secret.key</name>
+    <value>@S3_SECRET_KEY@</value>
+  </property>
+  <property>
+    <!-- The connector's createEngine() hard-codes fs.s3a.path.style.access=false
+         via conf.set(), then loads this core-site.xml via addResource(). Marking
+         it <final> makes this resource value win over that programmatic set(),
+         which is required for a custom-endpoint store like MinIO (virtual-host
+         addressing 'bucket.minio' can't resolve). -->
+    <name>fs.s3a.path.style.access</name>
+    <value>true</value>
+    <final>true</final>
+  </property>
+  <property>
+    <name>fs.s3a.connection.ssl.enabled</name>
+    <value>false</value>
+  </property>
+</configuration>

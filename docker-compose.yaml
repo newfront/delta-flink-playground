@@ -1,0 +1,134 @@
+name: delta-flink-playground
+
+# A local Apache Flink session cluster (1 JobManager + 2 TaskManagers) plus an
+# idle SQL-client container, all running the stock flink image with the
+# delta-flink connector + storage jars staged into the dist by usrlib/init.sh
+# (the same pattern as delta-io/delta flink/docker/2.0).
+#
+# Cross-project services (the OSS Unity Catalog server and its RustFS object
+# store from the neighbouring unitycatalog-playground) are reached over
+# host.docker.internal on the ports that playground publishes (:8080 / :9000).
+# Start it first with `just uc=local start` for the UC (sql/03) and ambient-S3
+# (sql/04) demos. The local-filesystem demos (sql/01, 02, 05) need nothing else.
+
+x-flink-common: &flink-common
+  image: flink:${FLINK_VERSION:-2.0.1}
+  extra_hosts:
+    # Let the containers reach services published on the host (UC :8080,
+    # RustFS :9000). Required on Linux/colima; harmless on Docker Desktop.
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./flink/usrlib:/opt/flink/usrlib
+    - ./sql:/sql:ro
+    - ./data:/opt/flink/data
+  environment: &flink-env
+    # S3A settings rendered into core-site.xml for the S3 path-based demos
+    # (sql/04). NOTE: this experimental connector hardcodes
+    # fs.s3a.path.style.access=false in createEngine(), so custom-endpoint S3
+    # stores (MinIO/RustFS) don't work via Flink SQL - only real AWS S3
+    # (virtual-host) does. See README "Connector limitations". These are here for
+    # a real-S3 endpoint; local-FS demos (sql/01, sql/02) ignore them.
+    S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+
+services:
+  jobmanager:
+    <<: *flink-common
+    hostname: jobmanager
+    container_name: dfp-jobmanager
+    command: /opt/flink/usrlib/init.sh jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      <<: *flink-env
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        parallelism.default: 1
+        execution.checkpointing.interval: 10s
+        state.checkpoints.dir: file:///opt/flink/data/_checkpoints
+        state.backend.type: hashmap
+
+  taskmanager:
+    <<: *flink-common
+    container_name: dfp-taskmanager-1
+    command: /opt/flink/usrlib/init.sh taskmanager
+    depends_on: [jobmanager]
+    scale: 1
+    environment:
+      <<: *flink-env
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-2}
+
+  taskmanager2:
+    <<: *flink-common
+    container_name: dfp-taskmanager-2
+    command: /opt/flink/usrlib/init.sh taskmanager
+    depends_on: [jobmanager]
+    environment:
+      <<: *flink-env
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-2}
+
+  # No server role: stages the same jars, renders core-site.xml, then idles so
+  # `just sql <file>` can `docker compose exec` sql-client.sh into it. It submits
+  # jobs to the session cluster (execution.target: remote -> jobmanager:8081).
+  sql-client:
+    <<: *flink-common
+    hostname: sql-client
+    container_name: dfp-sql-client
+    command: /opt/flink/usrlib/init.sh idle
+    depends_on: [jobmanager, taskmanager]
+    environment:
+      <<: *flink-env
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        rest.port: 8081
+        execution.target: remote
+
+  # --- Redpanda (Kafka API) for the upsert CDC demo (sql/06) ------------------
+  # Enabled only with the `kafka` compose profile (`just kafka=on ...`).
+  redpanda:
+    profiles: [kafka]
+    image: redpandadata/redpanda:latest
+    hostname: redpanda
+    container_name: dfp-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      # INTERNAL: reachable from Flink containers as redpanda:29092.
+      # EXTERNAL: reachable from the host as localhost:9092 (for rpk producers).
+      - --advertise-kafka-addr=INTERNAL://redpanda:29092,EXTERNAL://localhost:${REDPANDA_KAFKA_PORT:-9092}
+      - --mode=dev-container
+    ports:
+      - "${REDPANDA_KAFKA_PORT:-9092}:9092"
+      - "${REDPANDA_ADMIN_PORT:-9644}:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # One-shot: create the keyed topic used by the upsert-kafka source.
+  redpanda-init:
+    profiles: [kafka]
+    image: redpandadata/redpanda:latest
+    container_name: dfp-redpanda-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        rpk topic create ecomm.v1.clickstream
+        --brokers redpanda:29092 -p 1 -r 1 || true
+    restart: "no"
